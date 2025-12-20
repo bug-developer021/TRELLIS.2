@@ -173,14 +173,116 @@ Upon execution, the script generates the following files:
 
 **Note:** The `.glb` file is exported in `OPAQUE` mode by default. Although the alpha channel is preserved within the texture map, it is not active initially. To enable transparency, import the asset into your 3D software and manually connect the texture's alpha channel to the material's opacity or alpha input.
 
-#### Web Demo
+#### Web Demo (Frontend + Async Backend)
 
-[app.py](app.py) provides a simple web demo for image to 3D asset generation. you can run the demo with the following command:
+The web demo is split into a Gradio frontend (`app.py`) and an async FastAPI backend (`backend_service.py`).
+Start the backend first, then run the frontend with the backend URL configured.
+
+**Start backend service**
 ```sh
+export TRELLIS2_MAX_ACTIVE_TASKS=1     # max concurrent GPU jobs
+export TRELLIS2_WORKER_COUNT=2         # async workers for queueing
+uvicorn backend_service:app --host 0.0.0.0 --port 8000
+```
+
+**Start frontend**
+```sh
+export TRELLIS2_BACKEND_URL=http://127.0.0.1:8000
 python app.py
 ```
 
-Then, you can access the demo at the address shown in the terminal.
+Then access the demo at the address shown in the terminal.
+
+#### Backend API Reference
+
+All endpoints are JSON unless otherwise noted.
+
+**POST `/preprocess`** — remove background and crop image
+```json
+{
+  "image_base64": "<base64 PNG bytes>"
+}
+```
+Response:
+```json
+{
+  "image_base64": "<base64 PNG bytes>"
+}
+```
+
+**POST `/tasks`** — submit an async generation task
+```json
+{
+  "image_base64": "<base64 PNG bytes>",
+  "seed": 0,
+  "resolution": "1024",
+  "sampler_params": {
+    "sparse_structure": {
+      "steps": 12,
+      "guidance_strength": 7.5,
+      "guidance_rescale": 0.7,
+      "rescale_t": 5.0
+    },
+    "shape_slat": {
+      "steps": 12,
+      "guidance_strength": 7.5,
+      "guidance_rescale": 0.5,
+      "rescale_t": 3.0
+    },
+    "tex_slat": {
+      "steps": 12,
+      "guidance_strength": 1.0,
+      "guidance_rescale": 0.0,
+      "rescale_t": 3.0
+    }
+  }
+}
+```
+Response:
+```json
+{
+  "task_id": "<uuid>"
+}
+```
+
+**GET `/tasks/{task_id}`** — query task status
+Response:
+```json
+{
+  "status": "queued|running|succeeded|failed",
+  "error": "optional error message"
+}
+```
+
+**GET `/tasks/{task_id}/result`** — retrieve render previews
+Response:
+```json
+{
+  "rendered": {
+    "normal": ["data:image/jpeg;base64,...", "..."],
+    "clay": ["data:image/jpeg;base64,...", "..."],
+    "base_color": ["data:image/jpeg;base64,...", "..."],
+    "shaded_forest": ["data:image/jpeg;base64,...", "..."],
+    "shaded_sunset": ["data:image/jpeg;base64,...", "..."],
+    "shaded_courtyard": ["data:image/jpeg;base64,...", "..."]
+  },
+  "resolution": "1024"
+}
+```
+
+**POST `/tasks/{task_id}/extract`** — export GLB from a completed task
+```json
+{
+  "decimation_target": 500000,
+  "texture_size": 2048
+}
+```
+Response:
+```json
+{
+  "glb_path": "/absolute/path/to/sample_YYYY-MM-DDTHHMMSS.mmm.glb"
+}
+```
 
 ### 2. PBR Texture Generation
 
