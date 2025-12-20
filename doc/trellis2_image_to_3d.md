@@ -6,15 +6,15 @@
 
 ```mermaid
 flowchart TD
-    A[输入图像 Image (PIL)] --> B[预处理: preprocess_image]
-    B -->|去背景/裁剪/缩放| C[条件特征提取: image_cond_model]
-    C -->|cond_512/cond_1024| D[稀疏结构采样: sparse_structure_flow + sampler]
-    D -->|稀疏体素坐标 coords| E[形状 SLat 采样: shape_slat_flow + sampler]
-    E -->|shape_slat| F[形状解码: shape_slat_decoder]
-    F -->|Mesh + subs| G[纹理 SLat 采样: tex_slat_flow + sampler]
-    G -->|tex_slat| H[纹理解码: tex_slat_decoder]
-    H -->|纹理体素 attrs| I[MeshWithVoxel 输出]
-    I -->|可选导出| J[o_voxel.postprocess.to_glb → GLB]
+    A["输入图像 Image (PIL)"] --> B["预处理: preprocess_image"]
+    B -->|"去背景/裁剪/缩放"| C["条件特征提取: image_cond_model"]
+    C -->|"cond_512/cond_1024"| D["稀疏结构采样: sparse_structure_flow + sampler"]
+    D -->|"稀疏体素坐标 coords"| E["形状 SLat 采样: shape_slat_flow + sampler"]
+    E -->|"shape_slat"| F["形状解码: shape_slat_decoder"]
+    F -->|"Mesh + subs"| G["纹理 SLat 采样: tex_slat_flow + sampler"]
+    G -->|"tex_slat"| H["纹理解码: tex_slat_decoder"]
+    H -->|"纹理体素 attrs"| I["MeshWithVoxel 输出"]
+    I -->|"可选导出"| J["o_voxel.postprocess.to_glb → GLB"]
 ```
 
 ### 模块清单与输入输出
