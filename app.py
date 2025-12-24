@@ -17,6 +17,7 @@ from trellis2.pipelines import Trellis2ImageTo3DPipeline
 from trellis2.renderers import EnvMap
 from trellis2.utils import render_utils
 import o_voxel
+from storage_backend import get_storage_backend
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -402,6 +403,20 @@ def image_to_3d(
     images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
     state = pack_state(latents)
     torch.cuda.empty_cache()
+
+    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
+    os.makedirs(user_dir, exist_ok=True)
+    storage = get_storage_backend()
+    timestamp = datetime.now().strftime("%Y-%m-%dT%H%M%S%f")
+    image_urls = {}
+    for mode in MODES:
+        render_key = mode["render_key"]
+        image_urls[render_key] = []
+        for s_idx in range(STEPS):
+            filename = f"preview_{render_key}_{s_idx}_{timestamp}.jpg"
+            local_path = os.path.join(user_dir, filename)
+            Image.fromarray(images[render_key][s_idx]).save(local_path, format="JPEG", quality=90)
+            image_urls[render_key].append(storage.upload_file(local_path))
     
     # --- HTML Construction ---
     # The Stack of 48 Images
@@ -416,13 +431,13 @@ def image_to_3d(
             vis_class = "visible" if is_visible else ""
             
             # Image Source
-            img_base64 = image_to_base64(Image.fromarray(images[mode['render_key']][s_idx]))
+            img_url = image_urls[mode['render_key']][s_idx]
             
             # Render the Tag
             images_html += f"""
                 <img id="{unique_id}" 
                      class="previewer-main-image {vis_class}" 
-                     src="{img_base64}" 
+                     src="{img_url}" 
                      loading="eager">
             """
     
@@ -485,7 +500,7 @@ def extract_glb(
         texture_size (int): The texture resolution.
 
     Returns:
-        str: The path to the extracted GLB file.
+        str: The URL to the extracted GLB file.
     """
     user_dir = os.path.join(TMP_DIR, str(req.session_hash))
     shape_slat, tex_slat, res = unpack_state(state)
@@ -511,7 +526,9 @@ def extract_glb(
     glb_path = os.path.join(user_dir, f'sample_{timestamp}.glb')
     glb.export(glb_path, extension_webp=True)
     torch.cuda.empty_cache()
-    return glb_path, glb_path
+    storage = get_storage_backend()
+    glb_url = storage.upload_file(glb_path)
+    return glb_url, glb_url
 
 
 with gr.Blocks(delete_cache=(600, 600)) as demo:
