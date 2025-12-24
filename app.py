@@ -1,22 +1,13 @@
 import gradio as gr
 
 import os
-os.environ['OPENCV_IO_ENABLE_OPENEXR'] = '1'
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
-from datetime import datetime
-import shutil
-import cv2
 from typing import *
-import torch
 import numpy as np
 from PIL import Image
 import base64
 import io
-from trellis2.modules.sparse import SparseTensor
-from trellis2.pipelines import Trellis2ImageTo3DPipeline
-from trellis2.renderers import EnvMap
-from trellis2.utils import render_utils
-import o_voxel
+import time
+import requests
 
 
 MAX_SEED = np.iinfo(np.int32).max
@@ -32,6 +23,7 @@ MODES = [
 STEPS = 8
 DEFAULT_MODE = 3
 DEFAULT_STEP = 3
+BACKEND_URL = os.environ.get("TRELLIS2_BACKEND_URL", "http://127.0.0.1:8000")
 
 
 css = """
@@ -299,13 +291,11 @@ def image_to_base64(image):
 
 
 def start_session(req: gr.Request):
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    os.makedirs(user_dir, exist_ok=True)
+    os.makedirs(TMP_DIR, exist_ok=True)
     
     
 def end_session(req: gr.Request):
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    shutil.rmtree(user_dir)
+    return None
 
 
 def preprocess_image(image: Image.Image) -> Image.Image:
@@ -318,27 +308,15 @@ def preprocess_image(image: Image.Image) -> Image.Image:
     Returns:
         Image.Image: The preprocessed image.
     """
-    processed_image = pipeline.preprocess_image(image)
-    return processed_image
-
-
-def pack_state(latents: Tuple[SparseTensor, SparseTensor, int]) -> dict:
-    shape_slat, tex_slat, res = latents
-    return {
-        'shape_slat_feats': shape_slat.feats.cpu().numpy(),
-        'tex_slat_feats': tex_slat.feats.cpu().numpy(),
-        'coords': shape_slat.coords.cpu().numpy(),
-        'res': res,
-    }
-    
-    
-def unpack_state(state: dict) -> Tuple[SparseTensor, SparseTensor, int]:
-    shape_slat = SparseTensor(
-        feats=torch.from_numpy(state['shape_slat_feats']).cuda(),
-        coords=torch.from_numpy(state['coords']).cuda(),
-    )
-    tex_slat = shape_slat.replace(torch.from_numpy(state['tex_slat_feats']).cuda())
-    return shape_slat, tex_slat, state['res']
+    if image is None:
+        return None
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    payload = {"image_base64": base64.b64encode(buffered.getvalue()).decode()}
+    response = requests.post(f"{BACKEND_URL}/preprocess", json=payload, timeout=300)
+    response.raise_for_status()
+    image_bytes = base64.b64decode(response.json()["image_base64"])
+    return Image.open(io.BytesIO(image_bytes))
 
 
 def get_seed(randomize_seed: bool, seed: int) -> int:
@@ -346,6 +324,80 @@ def get_seed(randomize_seed: bool, seed: int) -> int:
     Get the random seed.
     """
     return np.random.randint(0, MAX_SEED) if randomize_seed else seed
+
+
+def build_preview_html(rendered: dict) -> str:
+    images_html = ""
+    for m_idx, mode in enumerate(MODES):
+        render_key = mode["render_key"]
+        for s_idx in range(STEPS):
+            unique_id = f"view-m{m_idx}-s{s_idx}"
+            is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
+            vis_class = "visible" if is_visible else ""
+            img_base64 = rendered[render_key][s_idx]
+            images_html += f"""
+                <img id="{unique_id}"
+                     class="previewer-main-image {vis_class}"
+                     src="{img_base64}"
+                     loading="eager">
+            """
+
+    btns_html = ""
+    for idx, mode in enumerate(MODES):
+        active_class = "active" if idx == DEFAULT_MODE else ""
+        btns_html += f"""
+            <img src="{mode['icon_base64']}"
+                 class="mode-btn {active_class}"
+                 onclick="selectMode({idx})"
+                 title="{mode['name']}">
+        """
+
+    full_html = f"""
+    <div class="previewer-container">
+        <div class="tips-wrapper">
+            <div class="tips-icon">💡Tips</div>
+            <div class="tips-text">
+                <p>● <b>Render Mode</b> - Click on the circular buttons to switch between different render modes.</p>
+                <p>● <b>View Angle</b> - Drag the slider to change the view angle.</p>
+            </div>
+        </div>
+
+        <div class="display-row">
+            {images_html}
+        </div>
+
+        <div class="mode-row" id="btn-group">
+            {btns_html}
+        </div>
+
+        <div class="slider-row">
+            <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
+        </div>
+    </div>
+    """
+    return full_html
+
+
+def submit_task(image: Image.Image, payload: dict) -> str:
+    buffered = io.BytesIO()
+    image.save(buffered, format="PNG")
+    payload["image_base64"] = base64.b64encode(buffered.getvalue()).decode()
+    response = requests.post(f"{BACKEND_URL}/tasks", json=payload, timeout=300)
+    response.raise_for_status()
+    return response.json()["task_id"]
+
+
+def wait_for_task(task_id: str, progress: gr.Progress) -> None:
+    while True:
+        response = requests.get(f"{BACKEND_URL}/tasks/{task_id}", timeout=60)
+        response.raise_for_status()
+        payload = response.json()
+        status = payload["status"]
+        if status == "succeeded":
+            return
+        if status == "failed":
+            raise RuntimeError(payload.get("error", "Task failed"))
+        time.sleep(1)
 
 
 def image_to_3d(
@@ -366,111 +418,43 @@ def image_to_3d(
     tex_slat_rescale_t: float,
     req: gr.Request,
     progress=gr.Progress(track_tqdm=True),
-) -> str:
-    # --- Sampling ---
-    outputs, latents = pipeline.run(
-        image,
-        seed=seed,
-        preprocess_image=False,
-        sparse_structure_sampler_params={
-            "steps": ss_sampling_steps,
-            "guidance_strength": ss_guidance_strength,
-            "guidance_rescale": ss_guidance_rescale,
-            "rescale_t": ss_rescale_t,
+) -> Tuple[str, str]:
+    if image is None:
+        return None, empty_html
+    task_payload = {
+        "seed": seed,
+        "resolution": resolution,
+        "sampler_params": {
+            "sparse_structure": {
+                "steps": ss_sampling_steps,
+                "guidance_strength": ss_guidance_strength,
+                "guidance_rescale": ss_guidance_rescale,
+                "rescale_t": ss_rescale_t,
+            },
+            "shape_slat": {
+                "steps": shape_slat_sampling_steps,
+                "guidance_strength": shape_slat_guidance_strength,
+                "guidance_rescale": shape_slat_guidance_rescale,
+                "rescale_t": shape_slat_rescale_t,
+            },
+            "tex_slat": {
+                "steps": tex_slat_sampling_steps,
+                "guidance_strength": tex_slat_guidance_strength,
+                "guidance_rescale": tex_slat_guidance_rescale,
+                "rescale_t": tex_slat_rescale_t,
+            },
         },
-        shape_slat_sampler_params={
-            "steps": shape_slat_sampling_steps,
-            "guidance_strength": shape_slat_guidance_strength,
-            "guidance_rescale": shape_slat_guidance_rescale,
-            "rescale_t": shape_slat_rescale_t,
-        },
-        tex_slat_sampler_params={
-            "steps": tex_slat_sampling_steps,
-            "guidance_strength": tex_slat_guidance_strength,
-            "guidance_rescale": tex_slat_guidance_rescale,
-            "rescale_t": tex_slat_rescale_t,
-        },
-        pipeline_type={
-            "512": "512",
-            "1024": "1024_cascade",
-            "1536": "1536_cascade",
-        }[resolution],
-        return_latent=True,
-    )
-    mesh = outputs[0]
-    mesh.simplify(16777216) # nvdiffrast limit
-    images = render_utils.render_snapshot(mesh, resolution=1024, r=2, fov=36, nviews=STEPS, envmap=envmap)
-    state = pack_state(latents)
-    torch.cuda.empty_cache()
-    
-    # --- HTML Construction ---
-    # The Stack of 48 Images
-    images_html = ""
-    for m_idx, mode in enumerate(MODES):
-        for s_idx in range(STEPS):
-            # ID Naming Convention: view-m{mode}-s{step}
-            unique_id = f"view-m{m_idx}-s{s_idx}"
-            
-            # Logic: Only Mode 0, Step 0 is visible initially
-            is_visible = (m_idx == DEFAULT_MODE and s_idx == DEFAULT_STEP)
-            vis_class = "visible" if is_visible else ""
-            
-            # Image Source
-            img_base64 = image_to_base64(Image.fromarray(images[mode['render_key']][s_idx]))
-            
-            # Render the Tag
-            images_html += f"""
-                <img id="{unique_id}" 
-                     class="previewer-main-image {vis_class}" 
-                     src="{img_base64}" 
-                     loading="eager">
-            """
-    
-    # Button Row HTML
-    btns_html = ""
-    for idx, mode in enumerate(MODES):        
-        active_class = "active" if idx == DEFAULT_MODE else ""
-        # Note: onclick calls the JS function defined in Head
-        btns_html += f"""
-            <img src="{mode['icon_base64']}" 
-                 class="mode-btn {active_class}" 
-                 onclick="selectMode({idx})"
-                 title="{mode['name']}">
-        """
-    
-    # Assemble the full component
-    full_html = f"""
-    <div class="previewer-container">
-        <div class="tips-wrapper">
-            <div class="tips-icon">💡Tips</div>
-            <div class="tips-text">
-                <p>● <b>Render Mode</b> - Click on the circular buttons to switch between different render modes.</p>
-                <p>● <b>View Angle</b> - Drag the slider to change the view angle.</p>
-            </div>
-        </div>
-        
-        <!-- Row 1: Viewport containing 48 static <img> tags -->
-        <div class="display-row">
-            {images_html}
-        </div>
-        
-        <!-- Row 2 -->
-        <div class="mode-row" id="btn-group">
-            {btns_html}
-        </div>
-
-        <!-- Row 3: Slider -->
-        <div class="slider-row">
-            <input type="range" id="custom-slider" min="0" max="{STEPS - 1}" value="{DEFAULT_STEP}" step="1" oninput="onSliderChange(this.value)">
-        </div>
-    </div>
-    """
-    
-    return state, full_html
+    }
+    task_id = submit_task(image, task_payload)
+    wait_for_task(task_id, progress)
+    result_response = requests.get(f"{BACKEND_URL}/tasks/{task_id}/result", timeout=300)
+    result_response.raise_for_status()
+    rendered = result_response.json()["rendered"]
+    return task_id, build_preview_html(rendered)
 
 
 def extract_glb(
-    state: dict,
+    task_id: str,
     decimation_target: int,
     texture_size: int,
     req: gr.Request,
@@ -487,30 +471,19 @@ def extract_glb(
     Returns:
         str: The path to the extracted GLB file.
     """
-    user_dir = os.path.join(TMP_DIR, str(req.session_hash))
-    shape_slat, tex_slat, res = unpack_state(state)
-    mesh = pipeline.decode_latent(shape_slat, tex_slat, res)[0]
-    glb = o_voxel.postprocess.to_glb(
-        vertices=mesh.vertices,
-        faces=mesh.faces,
-        attr_volume=mesh.attrs,
-        coords=mesh.coords,
-        attr_layout=pipeline.pbr_attr_layout,
-        grid_size=res,
-        aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
-        decimation_target=decimation_target,
-        texture_size=texture_size,
-        remesh=True,
-        remesh_band=1,
-        remesh_project=0,
-        use_tqdm=True,
+    if not task_id:
+        raise gr.Error("请先生成模型再导出 GLB。")
+    payload = {
+        "decimation_target": decimation_target,
+        "texture_size": texture_size,
+    }
+    response = requests.post(
+        f"{BACKEND_URL}/tasks/{task_id}/extract",
+        json=payload,
+        timeout=300,
     )
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%dT%H%M%S") + f".{now.microsecond // 1000:03d}"
-    os.makedirs(user_dir, exist_ok=True)
-    glb_path = os.path.join(user_dir, f'sample_{timestamp}.glb')
-    glb.export(glb_path, extension_webp=True)
-    torch.cuda.empty_cache()
+    response.raise_for_status()
+    glb_path = response.json()["glb_path"]
     return glb_path, glb_path
 
 
@@ -623,23 +596,5 @@ if __name__ == "__main__":
     for i in range(len(MODES)):
         icon = Image.open(MODES[i]['icon'])
         MODES[i]['icon_base64'] = image_to_base64(icon)
-
-    pipeline = Trellis2ImageTo3DPipeline.from_pretrained('microsoft/TRELLIS.2-4B')
-    pipeline.cuda()
-    
-    envmap = {
-        'forest': EnvMap(torch.tensor(
-            cv2.cvtColor(cv2.imread('assets/hdri/forest.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device='cuda'
-        )),
-        'sunset': EnvMap(torch.tensor(
-            cv2.cvtColor(cv2.imread('assets/hdri/sunset.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device='cuda'
-        )),
-        'courtyard': EnvMap(torch.tensor(
-            cv2.cvtColor(cv2.imread('assets/hdri/courtyard.exr', cv2.IMREAD_UNCHANGED), cv2.COLOR_BGR2RGB),
-            dtype=torch.float32, device='cuda'
-        )),
-    }
     
     demo.launch(css=css, head=head)
